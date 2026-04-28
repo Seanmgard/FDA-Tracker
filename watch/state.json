@@ -1,3 +1,14 @@
 {
-  "pages": {}
+  "pages": {
+    "animal-drug-safety-labeling": {
+      "sha256": "3bfaedf12f3110f3690baad22f183ef73f9139091e21080f4daf5e5c8829f9c2",
+      "etag": "\"1777406344\"",
+      "url": "https://www.fda.gov/animal-veterinary/drug-labels/animal-drug-safety-related-labeling-changes"
+    },
+    "cvm-updates": {
+      "sha256": "dc26ec9593ca9b8ab468cf860d37d8fa4c99e3266c5e83d01c9eac3b787d50b2",
+      "etag": "\"1777403412\"",
+      "url": "https://www.fda.gov/animal-veterinary/news-events/cvm-updates"
+    }
+  }
 }
