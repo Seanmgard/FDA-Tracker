@@ -1,208 +1,164 @@
 #!/usr/bin/env python3
 """
-Fetch configured FDA pages, compare stable content fingerprints to watch/state.json,
-send email when a page changes, then update state.
+Every run:
+  1. Fetch each watched page and strip it to plain text.
+  2. Compare to the last saved text.
+  3. If anything changed, email a diff of what was added/removed.
+  4. Save the new text.
 
-Environment (email):
-  SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASSWORD
-  EMAIL_FROM, EMAIL_TO (comma-separated for multiple recipients)
-
+Required environment variables (set as GitHub Actions secrets):
+  SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
 Optional:
-  FDA_WATCH_BASELINE_EMAIL=1 — send email on first run when establishing baseline
+  SMTP_PORT  (default: 587)
 """
 
-from __future__ import annotations
-
-import hashlib
+import difflib
 import json
 import os
 import re
 import smtplib
 import ssl
 import sys
-import urllib.error
 import urllib.request
-from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = ROOT / "watch" / "config.json"
-STATE_PATH = ROOT / "watch" / "state.json"
+PAGES = [
+    {
+        "id": "labeling-changes",
+        "label": "Animal Drug Safety-Related Labeling Changes",
+        "url": "https://www.fda.gov/animal-veterinary/drug-labels/animal-drug-safety-related-labeling-changes",
+    },
+    {
+        "id": "cvm-updates",
+        "label": "CVM Updates (News & Events)",
+        "url": "https://www.fda.gov/animal-veterinary/news-events/cvm-updates",
+    },
+]
+
+STATE_FILE = Path(__file__).resolve().parents[1] / "watch" / "state.json"
 
 
-def load_json(path: Path) -> dict:
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    tmp.replace(path)
-
-
-def normalize_html(html: str) -> bytes:
-    """Reduce noise from scripts, styles, and whitespace churn."""
-    html = re.sub(r"<script\b[^>]*>.*?</script>", "", html, flags=re.I | re.S)
-    html = re.sub(r"<style\b[^>]*>.*?</style>", "", html, flags=re.I | re.S)
-    html = re.sub(r"\s+", " ", html)
-    return html.strip().encode("utf-8")
-
-
-def fingerprint(url: str, timeout: int = 60) -> tuple[str, str | None]:
-    """
-    Returns (sha256_hex, etag_or_none).
-    Uses ETag when present for a cheaper comparison signal; stored hash is always body-based.
-    """
+def fetch(url: str) -> str:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "FDA-Page-Watch/1.0 (+https://github.com/actions)",
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (compatible; FDA-Watch/1.0)",
+            "Accept": "text/html",
         },
-        method="GET",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        etag = resp.headers.get("ETag") or resp.headers.get("etag")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
-    try:
-        text = raw.decode("utf-8", errors="replace")
-    except Exception:
-        text = raw.decode(errors="replace")
 
-    digest = hashlib.sha256(normalize_html(text)).hexdigest()
-    return digest, etag
+def to_text(html: str) -> list[str]:
+    """Convert HTML to a list of non-empty plain-text lines."""
+    # Drop scripts and styles entirely
+    html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.I | re.S)
+    html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.I | re.S)
+    # Replace block tags with newlines
+    html = re.sub(r"<(br|p|div|li|tr|h[1-6])[^>]*>", "\n", html, flags=re.I)
+    # Strip remaining tags
+    html = re.sub(r"<[^>]+>", "", html)
+    # Decode entities
+    html = html.replace("&amp;", "&").replace("&nbsp;", " ").replace("&lt;", "<").replace("&gt;", ">").replace("&#39;", "'").replace("&quot;", '"')
+    lines = [line.strip() for line in html.splitlines()]
+    return [l for l in lines if l]
 
 
 def send_email(subject: str, body: str) -> None:
-    host = os.environ.get("SMTP_HOST", "").strip()
-    user = os.environ.get("SMTP_USER", "").strip()
-    password = os.environ.get("SMTP_PASSWORD", "").strip()
-    from_addr = os.environ.get("EMAIL_FROM", "").strip()
-    to_raw = os.environ.get("EMAIL_TO", "").strip()
+    host = os.environ.get("SMTP_HOST", "")
     port = int(os.environ.get("SMTP_PORT", "587"))
+    user = os.environ.get("SMTP_USER", "")
+    password = os.environ.get("SMTP_PASSWORD", "")
+    from_addr = os.environ.get("EMAIL_FROM", "")
+    to_addrs = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 
-    if not all([host, from_addr, to_raw]):
-        print(
-            "Email skipped: set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO",
-            file=sys.stderr,
-        )
+    if not (host and from_addr and to_addrs):
+        print("Email skipped — set SMTP_HOST, EMAIL_FROM, EMAIL_TO.", file=sys.stderr)
         return
 
-    recipients = [x.strip() for x in to_raw.split(",") if x.strip()]
-    if not recipients:
-        print("Email skipped: EMAIL_TO empty", file=sys.stderr)
-        return
-
-    msg = MIMEMultipart("alternative")
+    msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = from_addr
-    msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+    msg["To"] = ", ".join(to_addrs)
 
-    context = ssl.create_default_context()
-    with smtplib.SMTP(host, port, timeout=60) as server:
-        server.ehlo()
-        server.starttls(context=context)
-        server.ehlo()
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(host, port, timeout=30) as s:
+        s.starttls(context=ctx)
         if user and password:
-            server.login(user, password)
-        server.sendmail(from_addr, recipients, msg.as_string())
-
-    print(f"Sent email to {len(recipients)} recipient(s).")
+            s.login(user, password)
+        s.sendmail(from_addr, to_addrs, msg.as_string())
+    print(f"Email sent to {to_addrs}.")
 
 
 def main() -> int:
-    config = load_json(CONFIG_PATH)
-    state = load_json(STATE_PATH)
-    pages_cfg = config.get("pages") or []
-    pages_state: dict = state.setdefault("pages", {})
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state: dict = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
-    baseline_email = os.environ.get("FDA_WATCH_BASELINE_EMAIL", "").strip() in (
-        "1",
-        "true",
-        "yes",
-    )
+    alert_sections: list[str] = []
 
-    changes: list[tuple[dict, str, str | None, str | None]] = []
-    errors: list[str] = []
+    for page in PAGES:
+        pid, label, url = page["id"], page["label"], page["url"]
+        print(f"Fetching: {label}")
 
-    for entry in pages_cfg:
-        pid = entry["id"]
-        url = entry["url"]
-        label = entry.get("label") or pid
-        prev = pages_state.get(pid)
-        prev_hash = (prev or {}).get("sha256") if isinstance(prev, dict) else None
         try:
-            digest, etag = fingerprint(url)
-        except urllib.error.HTTPError as e:
-            errors.append(f"{label}: HTTP {e.code} {e.reason}")
-            continue
-        except urllib.error.URLError as e:
-            errors.append(f"{label}: {e.reason}")
-            continue
+            html = fetch(url)
         except Exception as e:
-            errors.append(f"{label}: {e}")
+            print(f"  ERROR fetching {url}: {e}", file=sys.stderr)
             continue
 
-        if prev_hash is None:
-            pages_state[pid] = {"sha256": digest, "etag": etag, "url": url}
-            print(f"[baseline] {label}: recorded fingerprint {digest[:12]}…")
-            if baseline_email:
-                changes.append((entry, digest, None, etag))
+        current_lines = to_text(html)
+        previous_lines = state.get(pid, {}).get("lines")
+
+        if previous_lines is None:
+            print(f"  First run — saving baseline.")
+            state[pid] = {"lines": current_lines}
             continue
 
-        if prev_hash != digest:
-            changes.append((entry, digest, prev_hash, etag))
+        if current_lines == previous_lines:
+            print(f"  No change.")
+            state[pid] = {"lines": current_lines}
+            continue
 
-        pages_state[pid] = {"sha256": digest, "etag": etag, "url": url}
+        # Something changed — compute a human-readable diff
+        diff = list(difflib.unified_diff(
+            previous_lines,
+            current_lines,
+            lineterm="",
+            n=2,
+        ))
+        added   = [l[1:] for l in diff if l.startswith("+") and not l.startswith("+++")]
+        removed = [l[1:] for l in diff if l.startswith("-") and not l.startswith("---")]
 
-    if changes:
-        lines = [
-            "One or more watched FDA pages changed since the last check.",
+        section_lines = [
+            f"{label}",
+            f"  {url}",
             "",
         ]
-        for entry, new_h, old_h, etag in changes:
-            label = entry.get("label") or entry["id"]
-            url = entry["url"]
-            lines.append(f"• {label}")
-            lines.append(f"  {url}")
-            if old_h:
-                lines.append(f"  fingerprint: {old_h[:12]}… → {new_h[:12]}…")
-            else:
-                lines.append(f"  fingerprint: {new_h[:12]}… (baseline)")
-            if etag:
-                lines.append(f"  ETag: {etag}")
-            lines.append("")
+        if added:
+            section_lines.append("  ADDED:")
+            section_lines.extend(f"    + {l}" for l in added)
+        if removed:
+            section_lines.append("  REMOVED:")
+            section_lines.extend(f"    - {l}" for l in removed)
 
-        if errors:
-            lines.append("Fetch warnings (other pages may still be updated):")
-            for e in errors:
-                lines.append(f"  - {e}")
+        alert_sections.append("\n".join(section_lines))
+        state[pid] = {"lines": current_lines}
+        print(f"  CHANGED (+{len(added)} lines, -{len(removed)} lines).")
 
-        subject = "FDA page watch: update detected"
-        body = "\n".join(lines)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+    if alert_sections:
+        body = "\n\n".join([
+            "An FDA page you're watching has been updated.\n",
+            *alert_sections,
+        ])
         try:
-            send_email(subject, body)
+            send_email("FDA page watch: update detected", body)
         except Exception as e:
             print(f"Failed to send email: {e}", file=sys.stderr)
             return 1
-
-    save_json(STATE_PATH, state)
-
-    if errors and not changes:
-        for e in errors:
-            print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-
-    for e in errors:
-        print(f"WARN: {e}", file=sys.stderr)
 
     return 0
 
