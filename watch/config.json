@@ -1,0 +1,14 @@
+{
+  "pages": [
+    {
+      "id": "animal-drug-safety-labeling",
+      "url": "https://www.fda.gov/animal-veterinary/drug-labels/animal-drug-safety-related-labeling-changes",
+      "label": "Animal drug safety–related labeling changes"
+    },
+    {
+      "id": "cvm-updates",
+      "url": "https://www.fda.gov/animal-veterinary/news-events/cvm-updates",
+      "label": "CVM updates (news & events)"
+    }
+  ]
+}
